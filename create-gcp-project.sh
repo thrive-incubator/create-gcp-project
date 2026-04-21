@@ -773,6 +773,7 @@ if [ "\$DEPLOY_BACKEND" = true ]; then
     --set-env-vars="FIREBASE_PROJECT_ID=\${PROJECT_ID},DEBUG=false" \\
     --format='value(status.url)')
 
+  BACKEND_URL="\${BACKEND_URL/http:\/\//https://}"
   echo "Backend deployed: \$BACKEND_URL"
 fi
 
@@ -784,6 +785,8 @@ if [ "\$DEPLOY_FRONTEND" = true ]; then
   if [ -z "\${BACKEND_URL:-}" ]; then
     BACKEND_URL=\$(gcloud run services describe \$BACKEND_SERVICE --region \$REGION --format='value(status.url)')
   fi
+  # Cloud Run always serves HTTPS — normalize in case gcloud returns http://
+  BACKEND_URL="\${BACKEND_URL/http:\/\//https://}"
 
   VITE_API_URL="\${BACKEND_URL}/api/v1"
 
@@ -937,6 +940,7 @@ if [ "\$DEPLOY_BACKEND" = true ]; then
     --set-env-vars="FIREBASE_PROJECT_ID=\${PROJECT_ID},DEBUG=true" \\
     --format='value(status.url)')
 
+  BACKEND_URL="\${BACKEND_URL/http:\/\//https://}"
   echo "Staging backend deployed: \$BACKEND_URL"
 fi
 
@@ -947,6 +951,8 @@ if [ "\$DEPLOY_FRONTEND" = true ]; then
   if [ -z "\${BACKEND_URL:-}" ]; then
     BACKEND_URL=\$(gcloud run services describe \$BACKEND_SERVICE --region \$REGION --format='value(status.url)')
   fi
+  # Cloud Run always serves HTTPS — normalize in case gcloud returns http://
+  BACKEND_URL="\${BACKEND_URL/http:\/\//https://}"
 
   VITE_API_URL="\${BACKEND_URL}/api/v1"
 
@@ -2342,7 +2348,13 @@ HOMETS_EOF
 
 create_frontend_src_api() {
   cat > frontend/src/services/api.ts << 'APITS_EOF'
-const BASE_URL = import.meta.env.VITE_API_URL || '/api/v1';
+// Force https for remote hosts to prevent mixed-content blocks (Cloud Run is always HTTPS)
+const _rawApiUrl = import.meta.env.VITE_API_URL || '/api/v1';
+const _isLocalhost = _rawApiUrl.includes('localhost') || _rawApiUrl.includes('127.0.0.1');
+const BASE_URL =
+  _rawApiUrl.startsWith('http://') && !_isLocalhost
+    ? _rawApiUrl.replace('http://', 'https://')
+    : _rawApiUrl;
 
 interface RequestOptions extends RequestInit {
   headers?: Record<string, string>;
