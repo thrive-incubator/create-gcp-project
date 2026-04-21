@@ -1689,6 +1689,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.core.config import get_settings
 
@@ -1730,6 +1731,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Trust Cloud Run's reverse proxy so redirect URLs use https:// not http://
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 
 # ---------------------------------------------------------------------------
