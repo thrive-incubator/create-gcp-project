@@ -410,13 +410,33 @@ phase_2_gcp_setup() {
     print_yellow "Firestore database may already exist (this is OK)"
   }
 
-  # 2e. Create Artifact Registry repo
+  # 2e. Create Artifact Registry repo (retry — API propagation can take >10s after enable)
   print_blue "Creating Artifact Registry repository..."
-  if ! gcloud artifacts repositories create gcr.io \
-    --repository-format=docker \
-    --location=us \
-    --project="$PROJECT_SLUG" 2>&1; then
-    print_yellow "Artifact Registry repo may already exist (this is OK)"
+  local AR_RETRIES=5
+  local AR_WAIT=15
+  local AR_CREATED=false
+  for i in $(seq 1 $AR_RETRIES); do
+    if gcloud artifacts repositories create gcr.io \
+      --repository-format=docker \
+      --location=us \
+      --project="$PROJECT_SLUG" 2>/dev/null; then
+      AR_CREATED=true
+      break
+    fi
+    # Might already exist (idempotent re-run)
+    if gcloud artifacts repositories describe gcr.io --location=us --project="$PROJECT_SLUG" > /dev/null 2>&1; then
+      AR_CREATED=true
+      break
+    fi
+    if [ $i -lt $AR_RETRIES ]; then
+      print_yellow "  Artifact Registry API not ready yet, retrying in ${AR_WAIT}s (attempt $i/$AR_RETRIES)..."
+      sleep $AR_WAIT
+    fi
+  done
+  if [ "$AR_CREATED" = true ]; then
+    print_green "Artifact Registry repository ready"
+  else
+    print_yellow "Could not create Artifact Registry repo — deploy.sh will retry on first deploy"
   fi
 
   # 2f. Create service account
@@ -690,15 +710,29 @@ gcloud config set project \$PROJECT_ID
 SA_NAME="${SA_NAME}"
 SA_EMAIL="\${SA_NAME}@\${PROJECT_ID}.iam.gserviceaccount.com"
 
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+
 if ! gcloud iam service-accounts describe \$SA_EMAIL > /dev/null 2>&1; then
   echo "First deploy detected — running fix_permissions.sh to set up IAM..."
-  SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
   if [ -f "\${SCRIPT_DIR}/fix_permissions.sh" ]; then
     bash "\${SCRIPT_DIR}/fix_permissions.sh"
   else
     echo "ERROR: fix_permissions.sh not found. Run it manually first."
     exit 1
   fi
+fi
+
+# ---- Ensure Artifact Registry gcr.io repo exists ----
+echo "=== Ensuring Artifact Registry repository exists ==="
+if ! gcloud artifacts repositories describe gcr.io --location=us --project=\$PROJECT_ID > /dev/null 2>&1; then
+  echo "  Creating gcr.io repository in Artifact Registry..."
+  gcloud artifacts repositories create gcr.io \\
+    --repository-format=docker \\
+    --location=us \\
+    --project=\$PROJECT_ID
+  echo "  Done."
+else
+  echo "  Repository already exists."
 fi
 
 # ---- Secrets ----
@@ -853,15 +887,29 @@ fi
 
 # ---- Auto-run fix_permissions.sh on first deploy ----
 SA_CHECK="${SA_EMAIL}"
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+
 if ! gcloud iam service-accounts describe \$SA_CHECK > /dev/null 2>&1; then
   echo "First deploy detected — running fix_permissions.sh to set up IAM..."
-  SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
   if [ -f "\${SCRIPT_DIR}/fix_permissions.sh" ]; then
     bash "\${SCRIPT_DIR}/fix_permissions.sh"
   else
     echo "ERROR: fix_permissions.sh not found. Run it manually first."
     exit 1
   fi
+fi
+
+# ---- Ensure Artifact Registry gcr.io repo exists ----
+echo "=== Ensuring Artifact Registry repository exists ==="
+if ! gcloud artifacts repositories describe gcr.io --location=us --project=\$PROJECT_ID > /dev/null 2>&1; then
+  echo "  Creating gcr.io repository in Artifact Registry..."
+  gcloud artifacts repositories create gcr.io \\
+    --repository-format=docker \\
+    --location=us \\
+    --project=\$PROJECT_ID
+  echo "  Done."
+else
+  echo "  Repository already exists."
 fi
 
 # ---- Backend Deploy ----
@@ -2327,7 +2375,10 @@ async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<
 
 export function checkHealth() {
   // Health endpoint is at root, not under /api/v1
-  return fetch('/health').then((r) => {
+  // In production, BASE_URL points to the backend (e.g. https://...run.app/api/v1)
+  // so we strip /api/v1 to get the backend base URL for /health
+  const backendBase = BASE_URL.replace(/\/api\/v1\/?$/, '');
+  return fetch(`${backendBase}/health`).then((r) => {
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return r.json();
   });
