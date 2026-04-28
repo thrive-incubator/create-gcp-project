@@ -479,6 +479,127 @@ SLEEP_STUB
 }
 
 # ---------------------------------------------------------------------------
+# T8: --parent-folder is documented in --help.
+# ---------------------------------------------------------------------------
+test_parent_folder_help_documented() {
+  echo "T8: --parent-folder in --help"
+  local out err
+  out=$(mktemp); err=$(mktemp)
+  run_capture "$out" "$err" -- "$SCRIPT" --help
+  local ok=0
+  grep -q -- "--parent-folder" "$out" || { echo "  no --parent-folder in --help output"; ok=1; }
+  grep -q "organizations/" "$out"     || { echo "  --help doesn't mention organizations/<id>"; ok=1; }
+  grep -q "folders/"        "$out"     || { echo "  --help doesn't mention folders/<id>"; ok=1; }
+  rm -f "$out" "$err"
+  assert "T8: --parent-folder documented in --help" "$ok"
+}
+
+# ---------------------------------------------------------------------------
+# T9: bad --parent-folder format aborts with exit 2.
+# ---------------------------------------------------------------------------
+test_parent_folder_invalid_format_aborts() {
+  echo "T9: --parent-folder bad format → exit 2"
+  local out err rc
+  out=$(mktemp); err=$(mktemp)
+  set +e
+  "$SCRIPT" --non-interactive \
+    --slug pf-bad-format-test \
+    --display-name X \
+    --billing FAKE \
+    --skip-gcp \
+    --target-dir /tmp/cgp-pf-bad-format \
+    --skip-github --no-staging --no-download-sa-key \
+    --parent-folder "not-a-real-prefix/123" \
+    >"$out" 2>"$err"
+  rc=$?
+  set -e
+  local ok=0
+  [ "$rc" = "2" ] || { echo "  expected exit 2, got $rc"; ok=1; }
+  grep -q "must start with 'organizations/' or 'folders/'" "$err" \
+    || { echo "  expected stderr to mention prefix requirement; got: $(head -3 "$err")"; ok=1; }
+  rm -rf "$out" "$err" /tmp/cgp-pf-bad-format
+  assert "T9: --parent-folder bad format aborts" "$ok"
+}
+
+# ---------------------------------------------------------------------------
+# T10: --parent-folder organizations/<non-numeric> aborts with exit 2.
+# ---------------------------------------------------------------------------
+test_parent_folder_invalid_id_aborts() {
+  echo "T10: --parent-folder non-numeric id → exit 2"
+  local out err rc
+  out=$(mktemp); err=$(mktemp)
+  set +e
+  "$SCRIPT" --non-interactive \
+    --slug pf-bad-id-test \
+    --display-name X \
+    --billing FAKE \
+    --skip-gcp \
+    --target-dir /tmp/cgp-pf-bad-id \
+    --skip-github --no-staging --no-download-sa-key \
+    --parent-folder "organizations/abc-not-numeric" \
+    >"$out" 2>"$err"
+  rc=$?
+  set -e
+  local ok=0
+  [ "$rc" = "2" ] || { echo "  expected exit 2, got $rc"; ok=1; }
+  grep -q "needs a numeric id" "$err" \
+    || { echo "  expected stderr 'needs a numeric id'; got: $(head -3 "$err")"; ok=1; }
+  rm -rf "$out" "$err" /tmp/cgp-pf-bad-id
+  assert "T10: --parent-folder non-numeric id aborts" "$ok"
+}
+
+# ---------------------------------------------------------------------------
+# T11: --parent-folder organizations/<id> is accepted (parses + scaffolds).
+# ---------------------------------------------------------------------------
+test_parent_folder_organizations_accepted() {
+  echo "T11: --parent-folder organizations/<id> accepted"
+  local out err rc
+  out=$(mktemp); err=$(mktemp)
+  set +e
+  "$SCRIPT" --non-interactive \
+    --slug pf-org-test \
+    --display-name X \
+    --billing FAKE \
+    --skip-gcp \
+    --target-dir /tmp/cgp-pf-org \
+    --skip-github --no-staging --no-download-sa-key \
+    --parent-folder "organizations/362695193512" \
+    >"$out" 2>"$err"
+  rc=$?
+  set -e
+  local ok=0
+  [ "$rc" = "0" ] || { echo "  expected exit 0 with --skip-gcp, got $rc; stderr: $(head -3 "$err")"; ok=1; }
+  [ -d /tmp/cgp-pf-org ] || { echo "  target-dir not created"; ok=1; }
+  rm -rf "$out" "$err" /tmp/cgp-pf-org
+  assert "T11: organizations/<id> parses + scaffolds" "$ok"
+}
+
+# ---------------------------------------------------------------------------
+# T12: --parent-folder folders/<id> is accepted.
+# ---------------------------------------------------------------------------
+test_parent_folder_folders_accepted() {
+  echo "T12: --parent-folder folders/<id> accepted"
+  local out err rc
+  out=$(mktemp); err=$(mktemp)
+  set +e
+  "$SCRIPT" --non-interactive \
+    --slug pf-folder-test \
+    --display-name X \
+    --billing FAKE \
+    --skip-gcp \
+    --target-dir /tmp/cgp-pf-folder \
+    --skip-github --no-staging --no-download-sa-key \
+    --parent-folder "folders/987654321" \
+    >"$out" 2>"$err"
+  rc=$?
+  set -e
+  local ok=0
+  [ "$rc" = "0" ] || { echo "  expected exit 0 with --skip-gcp, got $rc; stderr: $(head -3 "$err")"; ok=1; }
+  rm -rf "$out" "$err" /tmp/cgp-pf-folder
+  assert "T12: folders/<id> parses + scaffolds" "$ok"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests.
 # ---------------------------------------------------------------------------
 
@@ -494,6 +615,11 @@ test_file_generation
 test_master_secrets_dir_accepted
 test_master_secrets_missing_key
 test_master_secrets_populated_key
+test_parent_folder_help_documented
+test_parent_folder_invalid_format_aborts
+test_parent_folder_invalid_id_aborts
+test_parent_folder_organizations_accepted
+test_parent_folder_folders_accepted
 
 echo ""
 echo "============================================"

@@ -83,6 +83,11 @@ DISPLAY_NAME=""
 BILLING_ACCOUNT=""
 REGION="us-central1"
 SKIP_GCP=false
+# Format: "organizations/<numeric-id>" or "folders/<numeric-id>". Required
+# when running as a service account (SAs cannot create top-level projects).
+# Optional when running as a human with a single visible org (gcloud picks
+# the default).
+PARENT_FOLDER=""
 
 # Service flags (macOS bash 3.2 compatible -- no associative arrays)
 SVC_OPENAI=false
@@ -175,6 +180,12 @@ FLAGS:
   --download-sa-key               Download the service-account key to the
                                   project dir. Default in non-interactive mode.
   --no-download-sa-key            Don't download the service-account key.
+  --parent-folder <ref>           Org / folder to create the new project under.
+                                  Format: organizations/<id> OR folders/<id>.
+                                  Required when running as a service account
+                                  (SAs cannot create top-level projects). For a
+                                  human with a single visible org gcloud picks
+                                  the default; safe to leave unset.
 
 NOTES:
   - Existing interactive behavior is unchanged when --non-interactive is NOT set.
@@ -333,6 +344,11 @@ while [[ $# -gt 0 ]]; do
     --no-download-sa-key)
       DOWNLOAD_SA_KEY="no"
       ;;
+    --parent-folder)
+      require_value "$1" "${2:-}"
+      PARENT_FOLDER="$2"
+      shift
+      ;;
     *)
       echo "Unknown option: $1" >&2
       echo "Run with --help for usage." >&2
@@ -356,6 +372,39 @@ case "$FRONTEND_PORT" in
     exit 2
     ;;
 esac
+
+# Validate --parent-folder format if set. Build the gcloud flag we'll
+# splice into `gcloud projects create`. Empty PARENT_FOLDER → no flag,
+# gcloud uses its config default (works for a human with a single org).
+GCLOUD_PARENT_FLAG=""
+if [ -n "$PARENT_FOLDER" ]; then
+  case "$PARENT_FOLDER" in
+    organizations/*)
+      _id="${PARENT_FOLDER#organizations/}"
+      case "$_id" in
+        ''|*[!0-9]*)
+          echo "ERROR: --parent-folder organizations/<id> needs a numeric id (got '$_id')" >&2
+          exit 2
+          ;;
+      esac
+      GCLOUD_PARENT_FLAG="--organization=$_id"
+      ;;
+    folders/*)
+      _id="${PARENT_FOLDER#folders/}"
+      case "$_id" in
+        ''|*[!0-9]*)
+          echo "ERROR: --parent-folder folders/<id> needs a numeric id (got '$_id')" >&2
+          exit 2
+          ;;
+      esac
+      GCLOUD_PARENT_FLAG="--folder=$_id"
+      ;;
+    *)
+      echo "ERROR: --parent-folder must start with 'organizations/' or 'folders/' (got '$PARENT_FOLDER')" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 # Default for --download-sa-key in non-interactive mode is "yes" (we want the
 # key for the local-run flow). Interactive mode keeps the existing read prompt.
@@ -659,7 +708,16 @@ phase_2_gcp_setup() {
       break
     fi
 
-    if gcloud projects create "$PROJECT_SLUG" --name="$DISPLAY_NAME" 2>/dev/null; then
+    # Splice in $GCLOUD_PARENT_FLAG only when set — empty value would
+    # become an extra '' arg to gcloud and break parsing.
+    if [ -n "$GCLOUD_PARENT_FLAG" ]; then
+      _create_ok=false
+      gcloud projects create "$PROJECT_SLUG" --name="$DISPLAY_NAME" "$GCLOUD_PARENT_FLAG" 2>/dev/null && _create_ok=true
+    else
+      _create_ok=false
+      gcloud projects create "$PROJECT_SLUG" --name="$DISPLAY_NAME" 2>/dev/null && _create_ok=true
+    fi
+    if [ "$_create_ok" = true ]; then
       print_green "Project created"
       break
     fi
