@@ -11,9 +11,23 @@ set -euo pipefail
 # Creates the GCP project, enables APIs, sets IAM permissions, generates all
 # project files, and initializes git.
 #
-# Usage:
+# Two modes:
+#   - Interactive (default): the script prompts for every answer.
+#   - Non-interactive (--non-interactive): every answer comes from a flag.
+#
+# Usage (interactive):
 #   ./create-gcp-project.sh
-#   ./create-gcp-project.sh --skip-gcp    # Skip GCP setup, files only
+#   ./create-gcp-project.sh --skip-gcp                      # Skip GCP setup, files only
+#
+# Usage (non-interactive):
+#   ./create-gcp-project.sh --non-interactive \
+#     --slug my-cool-app --display-name "My Cool App" \
+#     --billing ABCD12-3456EF-789012 --region us-central1 \
+#     --services openai,gemini --staging --create-github \
+#     --master-secrets-dir ~/.gcp-master-secrets \
+#     --backend-port 8080 --frontend-port 5173
+#
+# Run --help for the full flag list.
 #
 # Prerequisites:
 #   - gcloud CLI (https://cloud.google.com/sdk/docs/install)
@@ -61,7 +75,7 @@ command_exists() {
 }
 
 # ---------------------------------------------------------------------------
-# Global configuration variables (set during interactive setup)
+# Global configuration variables (set during interactive setup or via flags)
 # ---------------------------------------------------------------------------
 
 PROJECT_SLUG=""
@@ -81,6 +95,15 @@ SVC_STORAGE=false
 INCLUDE_STAGING=false
 CREATE_GITHUB=false
 
+# Non-interactive mode
+NON_INTERACTIVE=false
+MASTER_SECRETS_DIR=""
+DOWNLOAD_SA_KEY=""        # tri-state: "" (unset), "yes", "no"
+SERVICES_FLAG_SET=false   # whether --services was passed (so we only flip from defaults if so)
+TARGET_DIR_FLAG=""        # explicit --target-dir override
+BACKEND_PORT=8080
+FRONTEND_PORT=5173
+
 # Derived
 SA_NAME=""
 SA_EMAIL=""
@@ -89,14 +112,277 @@ FRONTEND_SERVICE=""
 TARGET_DIR=""
 TOTAL_STEPS=4
 
+# ---------------------------------------------------------------------------
+# Help text
+# ---------------------------------------------------------------------------
+
+print_help() {
+  cat <<'HELP_EOF'
+create-gcp-project.sh — scaffold a full-stack GCP Cloud Run project.
+
+USAGE:
+  create-gcp-project.sh [flags]
+
+INTERACTIVE MODE (default):
+  Run with no flags (or only --skip-gcp) and the script prompts for everything.
+
+NON-INTERACTIVE MODE:
+  Pass --non-interactive plus all required flags. Every prompt is replaced by
+  the corresponding flag value; missing required flags cause exit 2.
+
+FLAGS:
+  --help                          Show this help and exit.
+  --skip-gcp                      Skip every gcloud call (file scaffolding only).
+
+  --non-interactive               Master gate. Disables every read prompt.
+  --slug <slug>                   Project slug (lowercase, 6-30 chars,
+                                  starts with a letter, [a-z0-9-]).
+                                  Required when --non-interactive is set.
+  --display-name "<name>"         Human-friendly project name.
+                                  Required when --non-interactive is set.
+  --billing <ID>                  Full billing account ID, e.g.
+                                  ABCD12-3456EF-789012.
+                                  Required when --non-interactive is set,
+                                  unless --skip-gcp is also set.
+  --region <region>               GCP region (default: us-central1).
+  --services <list>               Comma-separated list of optional services:
+                                    openai, openai-realtime, gemini,
+                                    anthropic, resend, storage
+                                  Example: --services openai,gemini,storage
+  --staging                       Generate deploy-staging.sh.
+  --no-staging                    Don't generate deploy-staging.sh (default).
+  --create-github                 Create a private GitHub repo via gh CLI.
+  --skip-github                   Don't create a GitHub repo (default).
+
+  --master-secrets-dir <path>     Read API keys from <path>/<service>-api-key
+                                  files instead of prompting via read -sp.
+                                  Files looked up:
+                                    openai-api-key      (if openai or openai-realtime)
+                                    gemini-api-key      (if gemini)
+                                    anthropic-api-key   (if anthropic)
+                                    resend-api-key      (if resend)
+                                  Missing required key → exit 2.
+
+  --backend-port <int>            Local backend / FastAPI port (default 8080).
+                                  Used in the generated Dockerfile, run-local.sh,
+                                  .env files, and Vite proxy.
+  --frontend-port <int>           Local frontend / Vite port (default 5173).
+                                  Used in run-local.sh and the generated CORS
+                                  configs.
+
+  --target-dir <path>             Where the project files land.
+                                  Default: $PWD/<slug>.
+  --download-sa-key               Download the service-account key to the
+                                  project dir. Default in non-interactive mode.
+  --no-download-sa-key            Don't download the service-account key.
+
+NOTES:
+  - Existing interactive behavior is unchanged when --non-interactive is NOT set.
+  - The script is idempotent: re-running with the same flags is safe.
+
+EXAMPLES:
+  Interactive:
+    ./create-gcp-project.sh
+
+  Non-interactive, GCP skipped, file scaffold only (good for tests):
+    ./create-gcp-project.sh --non-interactive \\
+      --slug my-cool-app --display-name "My Cool App" \\
+      --billing FAKE --skip-gcp --target-dir /tmp/my-cool-app \\
+      --services openai --skip-github --no-staging
+
+  Non-interactive with master secrets:
+    ./create-gcp-project.sh --non-interactive \\
+      --slug my-cool-app --display-name "My Cool App" \\
+      --billing ABCD12-3456EF-789012 --region us-central1 \\
+      --services openai,gemini --staging --create-github \\
+      --master-secrets-dir ~/.gcp-master-secrets \\
+      --backend-port 8080 --frontend-port 5173
+HELP_EOF
+}
+
+# ---------------------------------------------------------------------------
+# Helpers used by flag parsing
+# ---------------------------------------------------------------------------
+
+# Apply --services value (comma-separated list).
+# This RESETS all service flags to false then sets the listed ones.
+apply_services_list() {
+  local list="$1"
+  # Reset
+  SVC_OPENAI=false
+  SVC_OPENAI_REALTIME=false
+  SVC_GEMINI=false
+  SVC_ANTHROPIC=false
+  SVC_RESEND=false
+  SVC_STORAGE=false
+
+  # Split on commas (no associative arrays — bash 3.2 compatible).
+  local IFS=','
+  local svc
+  for svc in $list; do
+    # Trim whitespace
+    svc=$(echo "$svc" | sed 's/^ *//;s/ *$//')
+    case "$svc" in
+      openai) SVC_OPENAI=true ;;
+      openai-realtime)
+        SVC_OPENAI_REALTIME=true
+        # Realtime implies the standard API.
+        SVC_OPENAI=true
+        ;;
+      gemini)    SVC_GEMINI=true ;;
+      anthropic) SVC_ANTHROPIC=true ;;
+      resend)    SVC_RESEND=true ;;
+      storage)   SVC_STORAGE=true ;;
+      "") ;;   # tolerate empty entries
+      *)
+        echo "ERROR: unknown service in --services: '$svc'" >&2
+        echo "  Valid: openai, openai-realtime, gemini, anthropic, resend, storage" >&2
+        exit 2
+        ;;
+    esac
+  done
+}
+
+# Require a value for a flag that takes one.
+require_value() {
+  local flag="$1"
+  local value="${2:-}"
+  if [ -z "$value" ] || [ "${value#--}" != "$value" ]; then
+    echo "ERROR: $flag requires a value" >&2
+    exit 2
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Parse CLI args
+# ---------------------------------------------------------------------------
+
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --skip-gcp) SKIP_GCP=true ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    --help|-h)
+      print_help
+      exit 0
+      ;;
+    --skip-gcp)
+      SKIP_GCP=true
+      ;;
+    --non-interactive)
+      NON_INTERACTIVE=true
+      ;;
+    --slug)
+      require_value "$1" "${2:-}"
+      PROJECT_SLUG="$2"
+      shift
+      ;;
+    --display-name)
+      require_value "$1" "${2:-}"
+      DISPLAY_NAME="$2"
+      shift
+      ;;
+    --billing)
+      require_value "$1" "${2:-}"
+      BILLING_ACCOUNT="$2"
+      shift
+      ;;
+    --region)
+      require_value "$1" "${2:-}"
+      REGION="$2"
+      shift
+      ;;
+    --services)
+      require_value "$1" "${2:-}"
+      apply_services_list "$2"
+      SERVICES_FLAG_SET=true
+      shift
+      ;;
+    --staging)
+      INCLUDE_STAGING=true
+      ;;
+    --no-staging)
+      INCLUDE_STAGING=false
+      ;;
+    --create-github)
+      CREATE_GITHUB=true
+      ;;
+    --skip-github)
+      CREATE_GITHUB=false
+      ;;
+    --master-secrets-dir)
+      require_value "$1" "${2:-}"
+      MASTER_SECRETS_DIR="$2"
+      shift
+      ;;
+    --backend-port)
+      require_value "$1" "${2:-}"
+      BACKEND_PORT="$2"
+      shift
+      ;;
+    --frontend-port)
+      require_value "$1" "${2:-}"
+      FRONTEND_PORT="$2"
+      shift
+      ;;
+    --target-dir)
+      require_value "$1" "${2:-}"
+      TARGET_DIR_FLAG="$2"
+      shift
+      ;;
+    --download-sa-key)
+      DOWNLOAD_SA_KEY="yes"
+      ;;
+    --no-download-sa-key)
+      DOWNLOAD_SA_KEY="no"
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Run with --help for usage." >&2
+      exit 2
+      ;;
   esac
   shift
 done
+
+# Validate ports up-front (cheap to do here; saves us from aborting after a
+# half-finished GCP setup).
+case "$BACKEND_PORT" in
+  ''|*[!0-9]*)
+    echo "ERROR: --backend-port must be a positive integer (got '$BACKEND_PORT')" >&2
+    exit 2
+    ;;
+esac
+case "$FRONTEND_PORT" in
+  ''|*[!0-9]*)
+    echo "ERROR: --frontend-port must be a positive integer (got '$FRONTEND_PORT')" >&2
+    exit 2
+    ;;
+esac
+
+# Default for --download-sa-key in non-interactive mode is "yes" (we want the
+# key for the local-run flow). Interactive mode keeps the existing read prompt.
+if [ "$NON_INTERACTIVE" = true ] && [ -z "$DOWNLOAD_SA_KEY" ]; then
+  DOWNLOAD_SA_KEY="yes"
+fi
+
+# Validate non-interactive required flags up-front (before any side effects).
+if [ "$NON_INTERACTIVE" = true ]; then
+  if [ -z "$PROJECT_SLUG" ]; then
+    echo "ERROR: --non-interactive requires --slug" >&2
+    exit 2
+  fi
+  if ! validate_slug "$PROJECT_SLUG"; then
+    echo "ERROR: invalid --slug '$PROJECT_SLUG'." >&2
+    echo "  Must be 6-30 chars, start with a letter, lowercase alphanumeric and hyphens only." >&2
+    exit 2
+  fi
+  if [ -z "$DISPLAY_NAME" ]; then
+    echo "ERROR: --non-interactive requires --display-name" >&2
+    exit 2
+  fi
+  if [ "$SKIP_GCP" = false ] && [ -z "$BILLING_ACCOUNT" ]; then
+    echo "ERROR: --non-interactive requires --billing (unless --skip-gcp is set)" >&2
+    exit 2
+  fi
+fi
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +407,12 @@ preflight_checks() {
 
     # Check gcloud auth
     if ! gcloud auth print-identity-token > /dev/null 2>&1; then
+      if [ "$NON_INTERACTIVE" = true ]; then
+        print_red "gcloud is not authenticated."
+        echo "  In --non-interactive mode the script does not run 'gcloud auth login'." >&2
+        echo "  Run 'gcloud auth login' once (or activate a service account) and re-run." >&2
+        exit 2
+      fi
       print_yellow "Not authenticated with gcloud. Running gcloud auth login..."
       gcloud auth login || { print_red "Authentication failed"; exit 1; }
     fi
@@ -145,6 +437,29 @@ preflight_checks() {
 
 phase_1_interactive_setup() {
   print_step 1 "Project Configuration"
+
+  # In non-interactive mode, every value already came from a flag (and was
+  # validated up-front). Just derive the rest and return.
+  if [ "$NON_INTERACTIVE" = true ]; then
+    print_green "Project slug: ${PROJECT_SLUG}"
+    print_green "Display name: ${DISPLAY_NAME}"
+    [ "$SKIP_GCP" = false ] && print_green "Billing account: ${BILLING_ACCOUNT}"
+    print_green "Region: ${REGION}"
+    print_green "Services: openai=${SVC_OPENAI} openai-realtime=${SVC_OPENAI_REALTIME} gemini=${SVC_GEMINI} anthropic=${SVC_ANTHROPIC} resend=${SVC_RESEND} storage=${SVC_STORAGE}"
+    print_green "Staging scripts: $([ "$INCLUDE_STAGING" = true ] && echo "yes" || echo "no")"
+    print_green "GitHub repo: $([ "$CREATE_GITHUB" = true ] && echo "yes" || echo "no")"
+
+    SA_NAME="${PROJECT_SLUG}-runner"
+    SA_EMAIL="${SA_NAME}@${PROJECT_SLUG}.iam.gserviceaccount.com"
+    BACKEND_SERVICE="${PROJECT_SLUG}-backend"
+    FRONTEND_SERVICE="${PROJECT_SLUG}-frontend"
+    if [ -n "$TARGET_DIR_FLAG" ]; then
+      TARGET_DIR="$TARGET_DIR_FLAG"
+    else
+      TARGET_DIR="$(pwd)/${PROJECT_SLUG}"
+    fi
+    return
+  fi
 
   # --- Project slug ---
   while true; do
@@ -268,7 +583,11 @@ phase_1_interactive_setup() {
   SA_EMAIL="${SA_NAME}@${PROJECT_SLUG}.iam.gserviceaccount.com"
   BACKEND_SERVICE="${PROJECT_SLUG}-backend"
   FRONTEND_SERVICE="${PROJECT_SLUG}-frontend"
-  TARGET_DIR="$(pwd)/${PROJECT_SLUG}"
+  if [ -n "$TARGET_DIR_FLAG" ]; then
+    TARGET_DIR="$TARGET_DIR_FLAG"
+  else
+    TARGET_DIR="$(pwd)/${PROJECT_SLUG}"
+  fi
 }
 
 
@@ -301,9 +620,17 @@ confirm_selections() {
   echo -e "${CYAN}║${NC}"
   echo -e "${CYAN}║${NC}  Staging scripts: $([ "$INCLUDE_STAGING" = true ] && echo "yes" || echo "no")"
   echo -e "${CYAN}║${NC}  GitHub repo:     $([ "$CREATE_GITHUB" = true ] && echo "yes" || echo "no")"
+  echo -e "${CYAN}║${NC}  Backend port:    ${BACKEND_PORT}"
+  echo -e "${CYAN}║${NC}  Frontend port:   ${FRONTEND_PORT}"
   echo -e "${CYAN}║${NC}  Target dir:      ${TARGET_DIR}"
   echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
   echo ""
+
+  # Skip the proceed-confirm prompt in non-interactive mode.
+  if [ "$NON_INTERACTIVE" = true ]; then
+    return
+  fi
+
   read -p "Proceed? (Y/n): " confirm
   if [[ "$confirm" =~ ^[Nn]$ ]]; then
     echo "Aborted."
@@ -337,7 +664,15 @@ phase_2_gcp_setup() {
       break
     fi
 
-    # Creation failed -- offer options
+    # Creation failed.
+    if [ "$NON_INTERACTIVE" = true ]; then
+      print_red "Failed to create project '${PROJECT_SLUG}'. The ID may be taken globally."
+      echo "  In non-interactive mode the script does not pick alternate names." >&2
+      echo "  Re-run with a different --slug." >&2
+      exit 2
+    fi
+
+    # Interactive: offer options.
     local suggested="${PROJECT_SLUG}-$(shuf -i 1000-9999 -n 1 2>/dev/null || echo $((RANDOM % 9000 + 1000)))"
     print_red "Failed to create project '${PROJECT_SLUG}'. The ID may be taken globally."
     echo ""
@@ -496,41 +831,68 @@ phase_2_gcp_setup() {
     print_yellow "Secret 'jwt-secret-key' already exists"
   fi
 
-  # Conditional secrets
-  if [ "$SVC_OPENAI" = true ] || [ "$SVC_OPENAI_REALTIME" = true ]; then
-    if ! gcloud secrets describe openai-api-key > /dev/null 2>&1; then
-      echo ""
-      read -sp "  Enter your OpenAI API key (sk-...): " secret_val
-      echo ""
-      echo -n "$secret_val" | gcloud secrets create openai-api-key --data-file=- --replication-policy=automatic 2>/dev/null
-      print_green "Secret 'openai-api-key' created"
-    else
-      print_yellow "Secret 'openai-api-key' already exists"
+  # Conditional secrets.
+  #
+  # Behavior matrix:
+  #   - If MASTER_SECRETS_DIR is set, read each needed key from
+  #     <dir>/<service>-api-key. Missing file → exit 2.
+  #   - In non-interactive mode without MASTER_SECRETS_DIR, fail fast (we
+  #     would otherwise hit a `read -sp` and hang).
+  #   - Otherwise, fall back to the existing interactive `read -sp` prompt.
+  _create_secret_or_die() {
+    # _create_secret_or_die <secret-name> <prompt-label>
+    local secret_name="$1"
+    local prompt_label="$2"
+
+    if gcloud secrets describe "$secret_name" > /dev/null 2>&1; then
+      print_yellow "Secret '$secret_name' already exists"
+      return 0
     fi
+
+    if [ -n "$MASTER_SECRETS_DIR" ]; then
+      local secret_file="${MASTER_SECRETS_DIR}/${secret_name}"
+      if [ ! -f "$secret_file" ]; then
+        echo "ERROR: --master-secrets-dir set but $secret_file is missing" >&2
+        echo "  Refusing to create a half-provisioned project." >&2
+        exit 2
+      fi
+      gcloud secrets create "$secret_name" --data-file="$secret_file" --replication-policy=automatic 2>/dev/null
+      print_green "Secret '$secret_name' created (from master-secrets-dir)"
+      return 0
+    fi
+
+    if [ "$NON_INTERACTIVE" = true ]; then
+      echo "ERROR: secret '$secret_name' does not exist and no --master-secrets-dir was provided" >&2
+      echo "  Either pre-create the secret, or pass --master-secrets-dir <path>." >&2
+      exit 2
+    fi
+
+    # Interactive fallback (unchanged).
+    local secret_val
+    echo ""
+    read -sp "  Enter your ${prompt_label}: " secret_val
+    echo ""
+    echo -n "$secret_val" | gcloud secrets create "$secret_name" --data-file=- --replication-policy=automatic 2>/dev/null
+    print_green "Secret '$secret_name' created"
+  }
+
+  if [ "$SVC_OPENAI" = true ] || [ "$SVC_OPENAI_REALTIME" = true ]; then
+    _create_secret_or_die "openai-api-key" "OpenAI API key (sk-...)"
   fi
 
   if [ "$SVC_GEMINI" = true ]; then
-    if ! gcloud secrets describe gemini-api-key > /dev/null 2>&1; then
-      echo ""
-      read -sp "  Enter your Gemini API key: " secret_val
-      echo ""
-      echo -n "$secret_val" | gcloud secrets create gemini-api-key --data-file=- --replication-policy=automatic 2>/dev/null
-      print_green "Secret 'gemini-api-key' created"
-    else
-      print_yellow "Secret 'gemini-api-key' already exists"
-    fi
+    _create_secret_or_die "gemini-api-key" "Gemini API key"
   fi
 
   if [ "$SVC_ANTHROPIC" = true ]; then
-    if ! gcloud secrets describe anthropic-api-key > /dev/null 2>&1; then
-      echo ""
-      read -sp "  Enter your Anthropic API key (sk-ant-...): " secret_val
-      echo ""
-      echo -n "$secret_val" | gcloud secrets create anthropic-api-key --data-file=- --replication-policy=automatic 2>/dev/null
-      print_green "Secret 'anthropic-api-key' created"
-    else
-      print_yellow "Secret 'anthropic-api-key' already exists"
-    fi
+    _create_secret_or_die "anthropic-api-key" "Anthropic API key (sk-ant-...)"
+  fi
+
+  # Resend: in interactive mode the existing script never created a GCP secret
+  # for resend (resend reads from .env at runtime). With --master-secrets-dir,
+  # we extend the contract and upload it if a key file is provided.
+  if [ "$SVC_RESEND" = true ] && [ -n "$MASTER_SECRETS_DIR" ]; then
+    _create_secret_or_die "resend-api-key" "Resend API key"
   fi
 
   # 2i. Wait for IAM propagation
@@ -544,8 +906,23 @@ phase_2_gcp_setup() {
   echo "  For local development, you can use: gcloud auth application-default login"
   echo "  For CI/CD, consider Workload Identity Federation."
   echo ""
-  read -p "  Download service account key now? (y/N): " download_key
-  if [[ "$download_key" =~ ^[Yy]$ ]]; then
+
+  # Decide whether to download.
+  local do_download=false
+  if [ -n "$DOWNLOAD_SA_KEY" ]; then
+    # Flag explicitly set (--download-sa-key / --no-download-sa-key).
+    [ "$DOWNLOAD_SA_KEY" = "yes" ] && do_download=true
+  elif [ "$NON_INTERACTIVE" = true ]; then
+    # Should not happen — DOWNLOAD_SA_KEY defaults to "yes" when
+    # NON_INTERACTIVE is set. Belt-and-braces.
+    do_download=true
+  else
+    local download_key
+    read -p "  Download service account key now? (y/N): " download_key
+    [[ "$download_key" =~ ^[Yy]$ ]] && do_download=true
+  fi
+
+  if [ "$do_download" = true ]; then
     gcloud iam service-accounts keys create "${TARGET_DIR}/sa-key.json" \
       --iam-account="$SA_EMAIL" 2>/dev/null || {
       # Target dir may not exist yet, save to current dir
@@ -1010,8 +1387,8 @@ set -euo pipefail
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="\${SCRIPT_DIR}/backend"
 FRONTEND_DIR="\${SCRIPT_DIR}/frontend"
-BACKEND_PORT=8000
-FRONTEND_PORT=5173
+BACKEND_PORT=${BACKEND_PORT}
+FRONTEND_PORT=${FRONTEND_PORT}
 
 # ---- Parse arguments ----
 USE_TUNNEL=true
@@ -1387,13 +1764,13 @@ create_claude_md() {
 \`\`\`bash
 cd backend
 source venv/bin/activate
-uvicorn app.main:app --reload        # Run dev server (port 8000)
+uvicorn app.main:app --reload --port ${BACKEND_PORT}    # Run dev server (port ${BACKEND_PORT})
 \`\`\`
 
 ### Frontend
 \`\`\`bash
 cd frontend
-npm run dev      # Dev server (port 5173, proxies /api to backend)
+npm run dev      # Dev server (port ${FRONTEND_PORT}, proxies /api to backend)
 npm run build    # Production build (tsc + vite)
 npm run lint     # Lint
 \`\`\`
@@ -1476,7 +1853,7 @@ create_readme_md() {
    ./run-local.sh
    \`\`\`
 
-3. Open http://localhost:5173
+3. Open http://localhost:${FRONTEND_PORT}
 
 ### Deploy to Cloud Run
 
@@ -1511,7 +1888,7 @@ create_backend_files() {
 }
 
 create_backend_dockerfile() {
-  cat > backend/Dockerfile << 'DOCKERFILE_EOF'
+  cat > backend/Dockerfile << DOCKERFILE_EOF
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -1526,9 +1903,9 @@ COPY . .
 # Remove any secrets that might have been copied
 RUN rm -f .env .env.example service_account.json credentials.json
 
-EXPOSE 8080
+EXPOSE ${BACKEND_PORT}
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${BACKEND_PORT}"]
 DOCKERFILE_EOF
 }
 
@@ -1571,8 +1948,8 @@ create_backend_env_example() {
   cat > backend/.env.example << ENVEOF
 # --- Application ---
 DEBUG=true
-CORS_ORIGINS=http://localhost:5173
-FRONTEND_BASE_URL=http://localhost:5173
+CORS_ORIGINS=http://localhost:${FRONTEND_PORT}
+FRONTEND_BASE_URL=http://localhost:${FRONTEND_PORT}
 
 # --- Firebase ---
 FIREBASE_PROJECT_ID=${PROJECT_SLUG}
@@ -1744,9 +2121,11 @@ origins = [origin.strip() for origin in settings.cors_origins.split(",") if orig
 
 if settings.debug:
     debug_origins = [
+        "http://localhost:${FRONTEND_PORT}",
         "http://localhost:5173",
         "http://localhost:5174",
         "http://localhost:3000",
+        "http://127.0.0.1:${FRONTEND_PORT}",
         "http://127.0.0.1:5173",
     ]
     for o in debug_origins:
@@ -1802,8 +2181,8 @@ class Settings(BaseSettings):
 
     # Application
     debug: bool = True
-    cors_origins: str = "http://localhost:5173"
-    frontend_base_url: str = "http://localhost:5173"
+    cors_origins: str = "http://localhost:${FRONTEND_PORT}"
+    frontend_base_url: str = "http://localhost:${FRONTEND_PORT}"
 
     # Firebase
     firebase_project_id: str = ""
@@ -2021,7 +2400,7 @@ options:
 
 substitutions:
   _IMAGE_NAME: gcr.io/\${PROJECT_ID}/${FRONTEND_SERVICE}
-  _VITE_API_URL: http://localhost:8000/api/v1
+  _VITE_API_URL: http://localhost:${BACKEND_PORT}/api/v1
 CLOUDBUILD_EOF
 }
 
@@ -2096,7 +2475,7 @@ PKGJSON_EOF
 }
 
 create_frontend_vite_config() {
-  cat > frontend/vite.config.ts << 'VITECONF_EOF'
+  cat > frontend/vite.config.ts << VITECONF_EOF
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
@@ -2109,13 +2488,15 @@ export default defineConfig({
     },
   },
   server: {
+    port: ${FRONTEND_PORT},
+    strictPort: false,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:${BACKEND_PORT}',
         changeOrigin: true,
       },
       '/health': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:${BACKEND_PORT}',
         changeOrigin: true,
       },
     },
@@ -2222,8 +2603,8 @@ ESLINT_EOF
 }
 
 create_frontend_env() {
-  cat > frontend/.env << 'FRONTENV_EOF'
-VITE_API_URL=http://localhost:8000/api/v1
+  cat > frontend/.env << FRONTENV_EOF
+VITE_API_URL=http://localhost:${BACKEND_PORT}/api/v1
 FRONTENV_EOF
 }
 
@@ -2457,7 +2838,7 @@ print_summary() {
   echo -e "${GREEN}║${NC}  2. cp backend/.env.example backend/.env"
   echo -e "${GREEN}║${NC}     (fill in your API keys)"
   echo -e "${GREEN}║${NC}  3. ./run-local.sh --no-tunnel"
-  echo -e "${GREEN}║${NC}  4. Open http://localhost:5173"
+  echo -e "${GREEN}║${NC}  4. Open http://localhost:${FRONTEND_PORT}"
   echo -e "${GREEN}║${NC}     Click 'Test Backend Connection'"
   echo -e "${GREEN}║${NC}  5. ./deploy.sh"
   echo -e "${GREEN}║${NC}     (auto-runs fix_permissions.sh on first deploy)"
