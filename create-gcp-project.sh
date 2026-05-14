@@ -2661,8 +2661,17 @@ ESLINT_EOF
 }
 
 create_frontend_env() {
+  # Relative URL on purpose — the absolute form (http://localhost:<port>/...)
+  # used to be written here and broke every prototype the moment someone
+  # opened the cloudflared tunnel URL: their browser resolved `localhost`
+  # against their own machine, which has no backend running. The Vite
+  # dev server (see create_frontend_vite_config) proxies `/api/*` and
+  # `/health` to the local backend, so a relative VITE_API_URL Just Works
+  # both locally and through the tunnel. Production deploys override this
+  # at build time via the `_VITE_API_URL` Cloud Build substitution, which
+  # bakes in the absolute Cloud Run backend URL.
   cat > frontend/.env << FRONTENV_EOF
-VITE_API_URL=http://localhost:${BACKEND_PORT}/api/v1
+VITE_API_URL=/api/v1
 FRONTENV_EOF
 }
 
